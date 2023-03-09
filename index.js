@@ -1,78 +1,41 @@
-const AWS = require('aws-sdk');
+const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
-const s3 = new AWS.S3();
-// const ffmpeg = require('fluent-ffmpeg');
-// const path = require('path');
-const { exec } = require('child_process');
+const s3Client = new S3Client({ region: 'us-east-1' });
 
 exports.handler = async (event, context) => {
-  const bucketName = event.Records[0].s3.bucket.name;
-  const objectKey = event.Records[0].s3.object.key;
-  const fileExtension = objectKey.split('.').pop();
+  const bucket = event.Records[0].s3.bucket.name;
+  const key = event.Records[0].s3.object.key;
+  const tmpFilePath = `/tmp/${path.basename(key)}`;
 
-  if (fileExtension === 'wav') {
-    const params = { Bucket: bucketName, Key: objectKey };
-    const inputFile = `/tmp/${objectKey}`;
-    const outputFile = `/tmp/${objectKey.replace('.wav', '.mp3')}`;
+  try {
+    // Download the WAV file from S3
+    const getObjectCommand = new GetObjectCommand({ Bucket: bucket, Key: key });
+    const { Body } = await s3Client.send(getObjectCommand);
+    fs.writeFileSync(tmpFilePath, Body);
 
-    await s3.getObject(params).promise().then((data) => {
-      require('fs').writeFileSync(inputFile, data.Body);
-    });
-
+    // Convert WAV to MP3 using ffmpeg
+    const args = ['-i', tmpFilePath, '-acodec', 'libmp3lame', '-aq', '4', `${tmpFilePath}.mp3`];
     await new Promise((resolve, reject) => {
-      exec(`ffmpeg -i ${inputFile} ${outputFile}`, (error, stdout, stderr) => {
-        if (error) {
-          console.log(`exec error: ${error}`);
-          reject(error);
-        }
-        console.log(`stdout: ${stdout}`);
-        console.log(`stderr: ${stderr}`);
-        resolve();
-      });
+      const ffmpegProcess = spawn('/opt/bin/ffmpeg', args);
+      ffmpegProcess.on('error', reject);
+      ffmpegProcess.on('close', resolve);
     });
 
-    await s3.putObject({
-      Bucket: bucketName,
-      Key: objectKey.replace('.wav', '.mp3'),
-      Body: require('fs').readFileSync(outputFile),
-    }).promise();
+    // Upload the converted MP3 file back to S3
+    const mp3Key = `${path.parse(key).name}.mp3`;
+    const putObjectCommand = new PutObjectCommand({ Bucket: bucket, Key: mp3Key, Body: fs.readFileSync(`${tmpFilePath}.mp3`) });
+    await s3Client.send(putObjectCommand);
 
-    return {
-      statusCode: 200,
-      body: 'WAV to MP3 conversion successful',
-    };
+    // Delete temporary files
+    fs.unlinkSync(tmpFilePath);
+    fs.unlinkSync(`${tmpFilePath}.mp3`);
+
+    return { statusCode: 200, body: 'Conversion successful' };
+  } catch (error) {
+    console.error(error);
+    return { statusCode: 500, body: 'Conversion failed' };
   }
-  return {
-    statusCode: 400,
-    body: 'Unsupported file format',
-  };
 };
-// exports.handler = async (event, context) => {
-//   const bucket = event.Records[0].s3.bucket.name;
-//   const key = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
-//   const extension = path.extname(key).toLowerCase(); // Only process wav files
-//   if (extension !== '.wav') {
-//     console.log(`File ${key} is not a wav file. Skipping...`);
-//     return;
-//   } try {
-//     // Download the file from S3
-//     const params = {
-//       Bucket: bucket,
-//       Key: key,
-//     };
-//     const { Body } = await s3.getObject(params).promise(); // Convert the file to mp3
-//     const mp3Key = `${path.basename(key, extension)}.mp3`;
-//     const mp3Stream = ffmpeg(Body)
-//       .toFormat('mp3')
-//       .stream(); // Upload the mp3 file to S3
-//     const uploadParams = {
-//       Bucket: bucket,
-//       Key: mp3Key,
-//       Body: mp3Stream,
-//     };
-//     await s3.upload(uploadParams).promise();
-//     console.log(`Successfully converted ${key} to ${mp3Key}`);
-//   } catch (error) {
-//     console.error(`Error converting ${key}: ${error}`);
-//   }
-// };
